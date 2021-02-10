@@ -1,18 +1,3 @@
-using Pkg
-
-packages = [
-    "Flux",
-    "CUDA",
-    "Images",
-    "Metalhead",
-    "Zygote",
-    "Statistics",
-    "IterTools",
-    "Plots",
-]
-
-Pkg.add(packages)
-
 using Flux
 using Images
 using CUDA
@@ -22,6 +7,7 @@ using Statistics
 using Plots
 
 if has_cuda()
+    CUDA.allowscalar(false)
     device = gpu
     @info "CUDA is on"
 else
@@ -63,7 +49,7 @@ function style(m::vgg19, x)
     (s1, s2, s3, s4, s5)
 end
 
-function gram_matrix(mat, normalize=true)
+function gram_matrix(mat, normalize=false)
     h, w, c, n = size(mat)
     nm = reshape(mat, h * w, c)
     gram = transpose(nm) * nm
@@ -75,19 +61,17 @@ function gram_matrix(mat, normalize=true)
 end
 
 function content_loss(current, target)
-    h, w, c, n = size(current)
-    content_losses = 0.5f0 * sum((current .- target).^2)
-    return 8.0f0 * content_losses
+    1 / 2 * sum((current - target).^2)
 end
 
 function style_loss(current_features, target_features)
     num = length(current_features)
     ls = 0f0
-    weights = 2.0f0 .* Array(1:num)
+    weights = [1 / num for i in 1:num]
     for i in 1:num
         h, w, c, n = size(current_features[i])
-        lloss = 1 / (4 * num^2 * (h * w)^2) * sum((gram_matrix(current_features[i]) .- gram_matrix(target_features[i]))^2)
-        ls += 1 / 5 * lloss
+        lloss = 1 / (4 * c^2 * (h * w)^2) * sum((gram_matrix(current_features[i]) .- gram_matrix(target_features[i]))^2)
+        ls += weights[i] * lloss
     end
     return ls
 end
@@ -97,18 +81,23 @@ function tv_loss(target_image)
     h, w, c, q = size(img)
     ver_comp = sum((img[2:end,:,:,:] - img[1:end - 1,:,:,:]).^2)
     hor_comp = sum((img[:,2:end,:,:] - img[:,1:end - 1,:,:]).^2)
-    1.0f0 * (ver_comp + hor_comp) / (4 * h * w * c)
+    1 / (4 * h * w * c) * (ver_comp + hor_comp).^2
 end
 
 function total_loss(model::vgg19, target_image, contentf, stylef)
-    β = 8
-    α = 1e-3 * β
+    β = 1
+    α = 1e-3
+    γ = 1
     target_style = style(model, target_image)
     target_content = content(model, target_image)
     c_loss = content_loss(target_content, contentf)
-    s_loss = style_loss(target_style, stylef)
+    s_loss = style_loss(target_style, stylef) / 10
     t_loss = tv_loss(target_image)
-    return α * c_loss + β * s_loss + t_loss
+    total = α * c_loss + β * s_loss + γ * t_loss
+    println("%content: ", (α * c_loss) / total * 100)
+    println("%style: ", (β * s_loss) / total * 100)
+    println("%variation: ", (γ * t_loss) / total * 100)
+    total
 end
 
 function img_to_array(img)
@@ -129,7 +118,7 @@ function get_images()
         load(fn)
     end
     sim = mktemp() do fn, f
-        download("https://upload.wikimedia.org/wikipedia/commons/thumb/e/ea/Van_Gogh_-_Starry_Night_-_Google_Art_Project.jpg/1280px-Van_Gogh_-_Starry_Night_-_Google_Art_Project.jpg", fn)
+        download("https://ep01.epimg.net/cultura/imagenes/2020/04/05/babelia/1586104105_389523_1586104244_noticia_normal.jpg", fn)
         load(fn)
     end
     return img_to_array.((cim, sim))
