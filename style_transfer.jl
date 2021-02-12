@@ -67,7 +67,7 @@ end
 function style_loss(current_features, target_features)
     num = length(current_features)
     ls = 0f0
-    weights = [1 / num for i in 1:num]
+    weights = [i for i in 1:num]
     for i in 1:num
         h, w, c, n = size(current_features[i])
         lloss = 1 / (4 * c^2 * (h * w)^2) * sum((gram_matrix(current_features[i]) .- gram_matrix(target_features[i]))^2)
@@ -84,10 +84,7 @@ function tv_loss(target_image)
     1 / (4 * h * w * c) * (ver_comp + hor_comp).^2
 end
 
-function total_loss(model::vgg19, target_image, contentf, stylef)
-    β = 1
-    α = 1e-3
-    γ = 1
+function total_loss(model::vgg19, target_image, contentf, stylef; α=1e-3, β=1, γ=1)
     target_style = style(model, target_image)
     target_content = content(model, target_image)
     c_loss = content_loss(target_content, contentf)
@@ -102,9 +99,42 @@ end
 
 function img_to_array(img)
     r, g, b = red.(img), green.(img), blue.(img)
-    im = cat(r, g, b, dims=3)
-    re = imresize(im, (226, 226))
-    return Flux.unsqueeze(Float32.(re), 4)
+    cat(r, g, b, dims=3)
+end
+
+function norm(x)
+    means = [123.68, 116.779, 103.939 ]
+    stds = [58.393, 57.12, 57.375]
+    x .*= 255.0f0
+    for i in 1:3
+        x[:,:,i] .-= means[i]
+        x[:,:,i] ./= stds[i]
+    end
+    x
+end
+
+function preprocess_array(img_arr)
+    Flux.unsqueeze(imresize(norm(Float32.(img_arr)), (226, 226)), 4)
+end
+function deprocess_array(arr)
+    nim = arr |> cpu
+    nim .-= minimum(nim)
+    nim ./= maximum(nim)
+    if length(size(nim)) == 4
+        return nim[:,:,:,1]
+    end
+    nim
+end
+function dep_array(arr)
+    nim = arr |> cpu
+    
+    means = [123.68, 116.779, 103.939 ]
+    stds = [58.393, 57.12, 57.375]
+    for i in 1:3
+        nim[:,:,i] .*= stds[i]
+        nim[:,:,i] .+= means[i]
+    end
+    nim ./= 255.0f0
 end
 
 function arr_to_img(iar)
@@ -113,18 +143,20 @@ function arr_to_img(iar)
 end
 
 function get_images()
-    cim = mktemp() do fn, f
-        download("https://upload.wikimedia.org/wikipedia/commons/thumb/5/57/Cumulus_Clouds_over_Yellow_Prairie2.jpg/1920px-Cumulus_Clouds_over_Yellow_Prairie2.jpg", fn)
-        load(fn)
-    end
+    # cim = mktemp() do fn, f
+    #     download("https://upload.wikimedia.org/wikipedia/commons/thumb/5/57/Cumulus_Clouds_over_Yellow_Prairie2.jpg/1920px-Cumulus_Clouds_over_Yellow_Prairie2.jpg", fn)
+    #     load(fn)
+    # end
+    cim = Images.load("img2.jpg")
     sim = mktemp() do fn, f
-        download("https://ep01.epimg.net/cultura/imagenes/2020/04/05/babelia/1586104105_389523_1586104244_noticia_normal.jpg", fn)
+        download("https://upload.wikimedia.org/wikipedia/commons/thumb/c/c5/Edvard_Munch%2C_1893%2C_The_Scream%2C_oil%2C_tempera_and_pastel_on_cardboard%2C_91_x_73_cm%2C_National_Gallery_of_Norway.jpg/1200px-Edvard_Munch%2C_1893%2C_The_Scream%2C_oil%2C_tempera_and_pastel_on_cardboard%2C_91_x_73_cm%2C_National_Gallery_of_Norway.jpg", fn)
         load(fn)
     end
-    return img_to_array.((cim, sim))
+
+    return preprocess_array.(img_to_array.((cim, sim)))
 end
 
-function train(n::Int=25)
+function train(n::Int=50;plt::Bool=false,α=1e-3, β=1, γ=1)
     GC.gc()
     CUDA.reclaim()
     @info "Loading model"
@@ -138,7 +170,7 @@ function train(n::Int=25)
     stylef = style(vgg, style_image)
     contentf = content(vgg, content_image)
 
-    loss(x1) = total_loss(vgg, x1, contentf, stylef)
+    loss(x1) = total_loss(vgg, x1, contentf, stylef; α=α, β=β, γ=γ)
     losses = Array{Float32,1}()
     for i = 1:n
         @info "Iteration $i"
@@ -149,10 +181,22 @@ function train(n::Int=25)
         Flux.update!(opt, ipa, gs)
         ls = @show loss(target_image)
         push!(losses, ls)
-        display(arr_to_img(hcat(content_image, style_image, target_image ./ maximum(target_image))))
+        if plt
+            display(arr_to_img(hcat(deprocess_array.((content_image, style_image, target_image))...)))
+        end
     end
-
+    cimage = hcat(deprocess_array.((content_image, style_image, target_image))...)
+    bimage = hcat(dep_array.((content_image, style_image, target_image))...)
+    cimage = clamp.(cimage, 0.0f0, 1.0f0)
+    bimage = clamp.(bimage, 0.0f0, 1.0f0)
+    Images.save("output.jpg", arr_to_img(cimage))
+    Images.save("output2.jpg", arr_to_img(bimage))
     @info "Finished"
-    display(plot(losses))
+    if plt
+        display(plot(losses))
+        h, w, c, n = size(content_image)
+        histogram(reshape(deprocess_array(content_image), h * w, c), α=0.5, layout=3, label="content")
+        display(histogram!(reshape(deprocess_array(target_image), h * w, c), α=0.5, layout=3, label="target"))
+    end
     return target_image
 end
