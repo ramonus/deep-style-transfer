@@ -5,6 +5,7 @@ using Zygote
 using Metalhead
 using Statistics
 using Plots
+using IJulia
 
 if has_cuda()
     CUDA.allowscalar(false)
@@ -49,7 +50,7 @@ function style(m::vgg19, x)
     (s1, s2, s3, s4, s5)
 end
 
-function gram_matrix(mat, normalize=false)
+function gram_matrix(mat, normalize::Bool=false)
     h, w, c, n = size(mat)
     nm = reshape(mat, h * w, c)
     gram = transpose(nm) * nm
@@ -114,7 +115,7 @@ function norm(x)
 end
 
 function preprocess_array(img_arr)
-    Flux.unsqueeze(imresize(norm(Float32.(img_arr)), (226, 226)), 4)
+    Flux.unsqueeze(imresize((2 * Float32.(img_arr) .- 1), (226, 226)), 4)
 end
 function deprocess_array(arr)
     nim = arr |> cpu
@@ -142,30 +143,51 @@ function arr_to_img(iar)
     return RGB.([arr[:,:,i] for i in 1:3]...)
 end
 
-function get_images()
+styles = Dict(
+    :starry => "https://upload.wikimedia.org/wikipedia/commons/thumb/e/ea/Van_Gogh_-_Starry_Night_-_Google_Art_Project.jpg/300px-Van_Gogh_-_Starry_Night_-_Google_Art_Project.jpg",
+    :scream => "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c5/Edvard_Munch%2C_1893%2C_The_Scream%2C_oil%2C_tempera_and_pastel_on_cardboard%2C_91_x_73_cm%2C_National_Gallery_of_Norway.jpg/1200px-Edvard_Munch%2C_1893%2C_The_Scream%2C_oil%2C_tempera_and_pastel_on_cardboard%2C_91_x_73_cm%2C_National_Gallery_of_Norway.jpg",
+    :wave => "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a5/Tsunami_by_hokusai_19th_century.jpg/800px-Tsunami_by_hokusai_19th_century.jpg",
+    :giorgio => "https://upload.wikimedia.org/wikipedia/commons/thumb/d/da/Claude_Monet%2C_Saint-Georges_majeur_au_cr%C3%A9puscule.jpg/1200px-Claude_Monet%2C_Saint-Georges_majeur_au_cr%C3%A9puscule.jpg",
+    :naif => "https://instagram.fbcn11-1.fna.fbcdn.net/v/t51.2885-15/e35/s1080x1080/116798277_581494632757362_4406532804858518791_n.jpg?_nc_ht=instagram.fbcn11-1.fna.fbcdn.net&_nc_cat=106&_nc_ohc=7zx1nibyyZ8AX8Os3uD&tp=1&oh=b9301bf53db67ea59518f2d1ddec5024&oe=604ED2A8",
+    :wheat => "https://d16kd6gzalkogb.cloudfront.net/magazine_images/Vincent-van-Gogh-Whaet-Field-with-Cypresses.-Image-via-wikimedia.org_.jpg",
+    :sunrise => "https://www.artblr.com/upload/userfiles/images/Sunrise.jpg",
+    :nature => "https://sothebys-com.brightspotcdn.com/dims4/default/cd1ca73/2147483647/strip/true/crop/859x859+71+0/resize/1200x1200!/quality/90/?url=http%3A%2F%2Fsothebys-brightspot.s3.amazonaws.com%2Fdotcom%2Fa4%2Fb2%2F1f464df248a8bbfe8466856b32bc%2Fcover-pics.jpg",
+)
+
+function get_images(style::Symbol=:starry)
     # cim = mktemp() do fn, f
     #     download("https://upload.wikimedia.org/wikipedia/commons/thumb/5/57/Cumulus_Clouds_over_Yellow_Prairie2.jpg/1920px-Cumulus_Clouds_over_Yellow_Prairie2.jpg", fn)
     #     load(fn)
     # end
     cim = Images.load("img2.jpg")
     sim = mktemp() do fn, f
-        download("https://upload.wikimedia.org/wikipedia/commons/thumb/c/c5/Edvard_Munch%2C_1893%2C_The_Scream%2C_oil%2C_tempera_and_pastel_on_cardboard%2C_91_x_73_cm%2C_National_Gallery_of_Norway.jpg/1200px-Edvard_Munch%2C_1893%2C_The_Scream%2C_oil%2C_tempera_and_pastel_on_cardboard%2C_91_x_73_cm%2C_National_Gallery_of_Norway.jpg", fn)
+        download(styles[style], fn)
         load(fn)
     end
 
     return preprocess_array.(img_to_array.((cim, sim)))
 end
 
-function train(n::Int=50;plt::Bool=false,α=1e-3, β=1, γ=1)
+function train(sty::Symbol=:starry, n::Int=50;plt::Bool=false,α=1e-3, β=1, γ=1, init::Symbol=:content,lr::Float32=0.02f0)
     GC.gc()
     CUDA.reclaim()
     @info "Loading model"
     vgg = @time vgg19() |> device
     @info "Loading images"
-    content_image, style_image = @time get_images() .|> device
-    target_image = copy(content_image)
+    content_image, style_image = @time get_images(sty) .|> device
+    if init == :rand
+        target_image = randn(size(content_image)) |> device
+    elseif init == :content
+        target_image = copy(content_image)
+    elseif init == :style
+        target_image = copy(style_image)
+    elseif init == :diff
+        target_image = content_image - style_image
+    elseif init == :sum 
+        target_image = (content_image + style_image) ./ 2
+    end
     ipa = Flux.params(target_image)
-    opt = ADAM(0.02, (0.9, 0.999))
+    opt = ADAM(lr, (0.9, 0.999))
 
     stylef = style(vgg, style_image)
     contentf = content(vgg, content_image)
@@ -182,6 +204,7 @@ function train(n::Int=50;plt::Bool=false,α=1e-3, β=1, γ=1)
         ls = @show loss(target_image)
         push!(losses, ls)
         if plt
+            IJulia.clear_output(true)
             display(arr_to_img(hcat(deprocess_array.((content_image, style_image, target_image))...)))
         end
     end
@@ -195,8 +218,9 @@ function train(n::Int=50;plt::Bool=false,α=1e-3, β=1, γ=1)
     if plt
         display(plot(losses))
         h, w, c, n = size(content_image)
-        histogram(reshape(deprocess_array(content_image), h * w, c), α=0.5, layout=3, label="content")
-        display(histogram!(reshape(deprocess_array(target_image), h * w, c), α=0.5, layout=3, label="target"))
+        histogram(reshape(deprocess_array(content_image), h * w, c), α=0.3, layout=3, label="content")
+        histogram!(reshape(deprocess_array(target_image), h * w, c), α=0.3, layout=3, label="target")
+        display(histogram!(reshape(deprocess_array(style_image), h * w, c), α=0.3, layout=3, label="style"))
     end
     return target_image
 end
