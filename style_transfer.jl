@@ -50,15 +50,10 @@ function style(m::vgg19, x)
     (s1, s2, s3, s4, s5)
 end
 
-function gram_matrix(mat, normalize::Bool=false)
+function gram_matrix(mat)
     h, w, c, n = size(mat)
     nm = reshape(mat, h * w, c)
     gram = transpose(nm) * nm
-    if normalize
-        return gram ./ (2.0f0 * h * w * c)
-    else
-        return gram
-    end
 end
 
 function content_loss(current, target)
@@ -85,17 +80,19 @@ function tv_loss(target_image)
     1 / (4 * h * w * c) * (ver_comp + hor_comp).^2
 end
 
-function total_loss(model::vgg19, target_image, contentf, stylef; α=1e-3, β=1, γ=1)
+function total_loss(model::vgg19, target_image, contentf, stylef; α=1e-3, β=1, γ=1, splat::Bool=false)
     target_style = style(model, target_image)
     target_content = content(model, target_image)
     c_loss = content_loss(target_content, contentf)
     s_loss = style_loss(target_style, stylef) / 10
     t_loss = tv_loss(target_image)
     total = α * c_loss + β * s_loss + γ * t_loss
-    println("%content: ", (α * c_loss) / total * 100)
-    println("%style: ", (β * s_loss) / total * 100)
-    println("%variation: ", (γ * t_loss) / total * 100)
-    total
+
+    if splat
+        (total, α * c_loss, β * s_loss, γ * t_loss)
+    else
+        total
+    end
 end
 
 function img_to_array(img)
@@ -152,6 +149,8 @@ styles = Dict(
     :wheat => "https://d16kd6gzalkogb.cloudfront.net/magazine_images/Vincent-van-Gogh-Whaet-Field-with-Cypresses.-Image-via-wikimedia.org_.jpg",
     :sunrise => "https://www.artblr.com/upload/userfiles/images/Sunrise.jpg",
     :nature => "https://sothebys-com.brightspotcdn.com/dims4/default/cd1ca73/2147483647/strip/true/crop/859x859+71+0/resize/1200x1200!/quality/90/?url=http%3A%2F%2Fsothebys-brightspot.s3.amazonaws.com%2Fdotcom%2Fa4%2Fb2%2F1f464df248a8bbfe8466856b32bc%2Fcover-pics.jpg",
+    :curly => "https://thumbs.dreamstime.com/b/colorful-linear-wavy-texture-endless-abstract-pattern-template-design-decoration-88890825.jpg",
+    :brick => "https://external-content.duckduckgo.com/iu/?u=https%3A%2F%2Fimages.freecreatives.com%2Fwp-content%2Fuploads%2F2016%2F12%2FFree-Brick-Wall-Texture.jpg&f=1&nofb=1",
 )
 
 function get_images(style::Symbol=:starry)
@@ -176,7 +175,7 @@ function train(sty::Symbol=:starry, n::Int=50;plt::Bool=false,α=1e-3, β=1, γ=
     @info "Loading images"
     content_image, style_image = @time get_images(sty) .|> device
     if init == :rand
-        target_image = randn(size(content_image)) |> device
+        target_image = (2 .* rand(Float32, size(content_image)) .- 1) |> device
     elseif init == :content
         target_image = copy(content_image)
     elseif init == :style
@@ -192,8 +191,13 @@ function train(sty::Symbol=:starry, n::Int=50;plt::Bool=false,α=1e-3, β=1, γ=
     stylef = style(vgg, style_image)
     contentf = content(vgg, content_image)
 
-    loss(x1) = total_loss(vgg, x1, contentf, stylef; α=α, β=β, γ=γ)
     losses = Array{Float32,1}()
+    c_loss = Array{Float32,1}()
+    s_loss = Array{Float32,1}()
+    t_loss = Array{Float32,1}()
+
+    loss(x1; kwargs...) = total_loss(vgg, x1, contentf, stylef; α=α, β=β, γ=γ, kwargs...)
+
     for i = 1:n
         @info "Iteration $i"
         gs = gradient(ipa) do
@@ -201,25 +205,32 @@ function train(sty::Symbol=:starry, n::Int=50;plt::Bool=false,α=1e-3, β=1, γ=
         end
 
         Flux.update!(opt, ipa, gs)
-        ls = @show loss(target_image)
+        ls, cl, sl, tl = loss(target_image, splat=true)
         push!(losses, ls)
+        push!(c_loss, cl)
+        push!(s_loss, sl)
+        push!(t_loss, tl)
         if plt
             IJulia.clear_output(true)
-            display(arr_to_img(hcat(deprocess_array.((content_image, style_image, target_image))...)))
+            display(arr_to_img(hcat(deprocess_array.((content_image, style_image, clamp.(target_image, -1f0, 1f0)))...)))
         end
     end
     cimage = hcat(deprocess_array.((content_image, style_image, target_image))...)
-    bimage = hcat(dep_array.((content_image, style_image, target_image))...)
+    bimage = hcat(deprocess_array.((content_image, style_image, clamp.(target_image, -1f0, 1f0)))...)
     cimage = clamp.(cimage, 0.0f0, 1.0f0)
     bimage = clamp.(bimage, 0.0f0, 1.0f0)
     Images.save("output.jpg", arr_to_img(cimage))
     Images.save("output2.jpg", arr_to_img(bimage))
     @info "Finished"
     if plt
-        display(plot(losses))
+        plot(losses, title="Losses", label="Total loss")
+        plot!(c_loss, label="Content loss")
+        plot!(s_loss, label="Style loss")
+        plot!(t_loss, label="Total variation loss", yaxis=:log) |> display
+
         h, w, c, n = size(content_image)
         histogram(reshape(deprocess_array(content_image), h * w, c), α=0.3, layout=3, label="content")
-        histogram!(reshape(deprocess_array(target_image), h * w, c), α=0.3, layout=3, label="target")
+        histogram!(reshape(clamp.(deprocess_array(target_image), 0f0, 1f0), h * w, c), α=0.3, layout=3, label="target")
         display(histogram!(reshape(deprocess_array(style_image), h * w, c), α=0.3, layout=3, label="style"))
     end
     return target_image
