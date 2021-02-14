@@ -4,6 +4,7 @@ using CUDA
 using Zygote
 using Metalhead
 using Statistics
+using LinearAlgebra
 using Plots
 using IJulia
 
@@ -153,6 +154,26 @@ styles = Dict(
     :brick => "https://external-content.duckduckgo.com/iu/?u=https%3A%2F%2Fimages.freecreatives.com%2Fwp-content%2Fuploads%2F2016%2F12%2FFree-Brick-Wall-Texture.jpg&f=1&nofb=1",
 )
 
+function transfer_color(source::Array{RGB{Normed{UInt8,8}},2}, target::Array{RGB{Normed{UInt8,8}},2})::Array{RGB{Normed{UInt8,8}},2}
+    px = x -> [x.r,x.g,x.b]
+    s̄ = mean(px, source)
+    t̄ = mean(px, target)
+
+    covₛ = mean(x -> (px(x) - s̄) * transpose(px(x) - s̄), source)
+    covₜ = mean(x -> (px(x) - t̄) * transpose(px(x) - t̄), target)
+    vaₛ, veₛ = eigen(covₛ)
+    vaₜ, veₜ = eigen(covₜ)
+
+    covsqₛ = veₛ * diagm(vaₛ).^(1 / 2) * veₛ'
+    covsqₜ = veₜ * inv(diagm(vaₜ).^(1 / 2)) * veₜ'
+    A = covsqₛ * covsqₜ
+    b = s̄ - A * t̄
+    map(target) do x
+        r = clamp.(A * px(x) + b, 0f0, 1f0)
+        RGB(r...)
+    end
+end
+
 function get_images(style::Symbol=:starry)
     # cim = mktemp() do fn, f
     #     download("https://upload.wikimedia.org/wikipedia/commons/thumb/5/57/Cumulus_Clouds_over_Yellow_Prairie2.jpg/1920px-Cumulus_Clouds_over_Yellow_Prairie2.jpg", fn)
@@ -163,8 +184,9 @@ function get_images(style::Symbol=:starry)
         download(styles[style], fn)
         load(fn)
     end
+    colim = transfer_color(sim, cim)
 
-    return preprocess_array.(img_to_array.((cim, sim)))
+    return preprocess_array.(img_to_array.((colim, cim, sim)))
 end
 
 function train(sty::Symbol=:starry, n::Int=50;plt::Bool=false,α=1e-3, β=1, γ=1, init::Symbol=:content,lr::Float32=0.02f0)
@@ -173,7 +195,9 @@ function train(sty::Symbol=:starry, n::Int=50;plt::Bool=false,α=1e-3, β=1, γ=
     @info "Loading model"
     vgg = @time vgg19() |> device
     @info "Loading images"
-    content_image, style_image = @time get_images(sty) .|> device
+    ocontent_image, content_image, style_image = @time get_images(sty)
+    content_image = content_image |> device
+    style_image = style_image |> device
     if init == :rand
         target_image = (2 .* rand(Float32, size(content_image)) .- 1) |> device
     elseif init == :content
@@ -212,11 +236,11 @@ function train(sty::Symbol=:starry, n::Int=50;plt::Bool=false,α=1e-3, β=1, γ=
         push!(t_loss, tl)
         if plt
             IJulia.clear_output(true)
-            display(arr_to_img(hcat(deprocess_array.((content_image, style_image, clamp.(target_image, -1f0, 1f0)))...)))
+            display(arr_to_img(hcat(deprocess_array.((ocontent_image, style_image, clamp.(target_image, -1f0, 1f0)))...)))
         end
     end
-    cimage = hcat(deprocess_array.((content_image, style_image, target_image))...)
-    bimage = hcat(deprocess_array.((content_image, style_image, clamp.(target_image, -1f0, 1f0)))...)
+    cimage = hcat(deprocess_array.((ocontent_image, style_image, target_image))...)
+    bimage = hcat(deprocess_array.((ocontent_image, style_image, clamp.(target_image, -1f0, 1f0)))...)
     cimage = clamp.(cimage, 0.0f0, 1.0f0)
     bimage = clamp.(bimage, 0.0f0, 1.0f0)
     Images.save("output.jpg", arr_to_img(cimage))
@@ -229,7 +253,7 @@ function train(sty::Symbol=:starry, n::Int=50;plt::Bool=false,α=1e-3, β=1, γ=
         plot!(t_loss, label="Total variation loss", yaxis=:log) |> display
 
         h, w, c, n = size(content_image)
-        histogram(reshape(deprocess_array(content_image), h * w, c), α=0.3, layout=3, label="content")
+        histogram(reshape(deprocess_array(ocontent_image), h * w, c), α=0.3, layout=3, label="content")
         histogram!(reshape(clamp.(deprocess_array(target_image), 0f0, 1f0), h * w, c), α=0.3, layout=3, label="target")
         display(histogram!(reshape(deprocess_array(style_image), h * w, c), α=0.3, layout=3, label="style"))
     end
