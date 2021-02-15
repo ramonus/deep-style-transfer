@@ -112,8 +112,8 @@ function norm(x)
     x
 end
 
-function preprocess_array(img_arr)
-    Flux.unsqueeze(imresize((2 * Float32.(img_arr) .- 1), (226, 226)), 4)
+function preprocess_array(img_arr, dsize::Tuple{Integer,Integer}=(226, 226))
+    Flux.unsqueeze(imresize((2 * Float32.(img_arr) .- 1), dsize), 4)
 end
 function deprocess_array(arr)
     nim = arr |> cpu
@@ -152,6 +152,8 @@ styles = Dict(
     :nature => "https://sothebys-com.brightspotcdn.com/dims4/default/cd1ca73/2147483647/strip/true/crop/859x859+71+0/resize/1200x1200!/quality/90/?url=http%3A%2F%2Fsothebys-brightspot.s3.amazonaws.com%2Fdotcom%2Fa4%2Fb2%2F1f464df248a8bbfe8466856b32bc%2Fcover-pics.jpg",
     :curly => "https://thumbs.dreamstime.com/b/colorful-linear-wavy-texture-endless-abstract-pattern-template-design-decoration-88890825.jpg",
     :brick => "https://external-content.duckduckgo.com/iu/?u=https%3A%2F%2Fimages.freecreatives.com%2Fwp-content%2Fuploads%2F2016%2F12%2FFree-Brick-Wall-Texture.jpg&f=1&nofb=1",
+    :oil => "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSXq4Jf5qCXKxJTOLqbULdFo8nsmN6qW_F0ZQ&usqp=CAU",
+    :cubism => "https://www.artyfactory.com/art_appreciation/art_movements/art-movements/cubism/picasso_cubism.jpg",
 )
 
 function transfer_color(source::Array{RGB{Normed{UInt8,8}},2}, target::Array{RGB{Normed{UInt8,8}},2})::Array{RGB{Normed{UInt8,8}},2}
@@ -174,28 +176,37 @@ function transfer_color(source::Array{RGB{Normed{UInt8,8}},2}, target::Array{RGB
     end
 end
 
-function get_images(style::Symbol=:starry)
-    # cim = mktemp() do fn, f
-    #     download("https://upload.wikimedia.org/wikipedia/commons/thumb/5/57/Cumulus_Clouds_over_Yellow_Prairie2.jpg/1920px-Cumulus_Clouds_over_Yellow_Prairie2.jpg", fn)
-    #     load(fn)
-    # end
-    cim = Images.load("img2.jpg")
+function get_images(style::Symbol=:starry, transfer::Bool=true; content_url="", dsize=(226, 226))
+    if content_url === nothing
+        cim = Images.load("img.jpg")
+    else
+        cim = mktemp() do fn, f
+            download(content_url, fn)
+            load(fn)
+        end
+    end
+    if dsize === nothing
+        dsize = size(cim)
+    end
     sim = mktemp() do fn, f
         download(styles[style], fn)
         load(fn)
     end
-    colim = transfer_color(sim, cim)
-
-    return preprocess_array.(img_to_array.((colim, cim, sim)))
+    if transfer
+        colim = transfer_color(sim, cim)
+    else
+        colim = copy(cim)
+    end
+    return preprocess_array.(img_to_array.((cim, colim, sim)), (dsize,))
 end
 
-function train(sty::Symbol=:starry, n::Int=50;plt::Bool=false,α=1e-3, β=1, γ=1, init::Symbol=:content,lr::Float32=0.02f0)
+function train(sty::Symbol=:starry, n::Int=50;plt::Bool=false,α=1e-3, β=1, γ=1, init::Symbol=:content,lr::Float32=0.02f0,transfer::Bool=true,content_url=nothing,dsize=(226, 226),save_every=nothing)
     GC.gc()
     CUDA.reclaim()
     @info "Loading model"
     vgg = @time vgg19() |> device
     @info "Loading images"
-    ocontent_image, content_image, style_image = @time get_images(sty)
+    ocontent_image, content_image, style_image = @time get_images(sty, transfer, content_url=content_url, dsize=dsize)
     content_image = content_image |> device
     style_image = style_image |> device
     if init == :rand
@@ -222,6 +233,11 @@ function train(sty::Symbol=:starry, n::Int=50;plt::Bool=false,α=1e-3, β=1, γ=
 
     loss(x1; kwargs...) = total_loss(vgg, x1, contentf, stylef; α=α, β=β, γ=γ, kwargs...)
 
+    function save_image(i::Integer, content_image::Array{Float32,3}, style_image::Array{Float32,3}, target_image::Array{Float32,3})
+        image = hcat(deprocess_array.((content_image, style_image, clamp.(target_image, -1f0, 1f0)))...)
+        image = clamp.(image, 0.0f0, 1.0f0)
+        Images.save("output_$i.jpg", arr_to_img(image))
+    end
     for i = 1:n
         @info "Iteration $i"
         gs = gradient(ipa) do
@@ -238,6 +254,8 @@ function train(sty::Symbol=:starry, n::Int=50;plt::Bool=false,α=1e-3, β=1, γ=
             IJulia.clear_output(true)
             display(arr_to_img(hcat(deprocess_array.((ocontent_image, style_image, clamp.(target_image, -1f0, 1f0)))...)))
         end
+        save_every !== nothing && i % save_every == 0 && save_image(i, ocontent_image, style_image, target_image)
+        
     end
     cimage = hcat(deprocess_array.((ocontent_image, style_image, target_image))...)
     bimage = hcat(deprocess_array.((ocontent_image, style_image, clamp.(target_image, -1f0, 1f0)))...)
