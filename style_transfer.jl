@@ -7,6 +7,8 @@ using Statistics
 using LinearAlgebra
 using Plots
 using IJulia
+using Tar
+using BSON:@save
 
 if has_cuda()
     CUDA.allowscalar(false)
@@ -42,6 +44,7 @@ end
 function content(m::vgg19, x)
     x |> m.style1 |> m.style2 |> m.style3 |> m.style4 |> m.style5 |> m.content1
 end
+
 function style(m::vgg19, x)
     s1 = m.style1(x)
     s2 = m.style2(s1)
@@ -55,6 +58,7 @@ function gram_matrix(mat)
     h, w, c, n = size(mat)
     nm = reshape(mat, h * w, c)
     gram = transpose(nm) * nm
+    gram
 end
 
 function content_loss(current, target)
@@ -113,17 +117,20 @@ function norm(x)
 end
 
 function preprocess_array(img_arr, dsize::Tuple{Integer,Integer}=(226, 226))
-    Flux.unsqueeze(imresize((2 * Float32.(img_arr) .- 1), dsize), 4)
+    Flux.unsqueeze(imresize((2 * map(clamp01nan, Float32.(img_arr)) .- 1), dsize), 4)
 end
+
 function deprocess_array(arr)
-    nim = arr |> cpu
+    # Last step towards image transformation
+    nim = clamp.(arr, -1f0, 1f0) |> cpu
     nim .-= minimum(nim)
     nim ./= maximum(nim)
     if length(size(nim)) == 4
         return nim[:,:,:,1]
     end
-    nim
+    map(clamp01nan, nim)
 end
+
 function dep_array(arr)
     nim = arr |> cpu
     
@@ -154,6 +161,7 @@ styles = Dict(
     :brick => "https://external-content.duckduckgo.com/iu/?u=https%3A%2F%2Fimages.freecreatives.com%2Fwp-content%2Fuploads%2F2016%2F12%2FFree-Brick-Wall-Texture.jpg&f=1&nofb=1",
     :oil => "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSXq4Jf5qCXKxJTOLqbULdFo8nsmN6qW_F0ZQ&usqp=CAU",
     :cubism => "https://www.artyfactory.com/art_appreciation/art_movements/art-movements/cubism/picasso_cubism.jpg",
+    :composition => "https://upload.wikimedia.org/wikipedia/commons/b/b4/Vassily_Kandinsky%2C_1913_-_Composition_7.jpg",
 )
 
 function transfer_color(source::Array{RGB{Normed{UInt8,8}},2}, target::Array{RGB{Normed{UInt8,8}},2})::Array{RGB{Normed{UInt8,8}},2}
@@ -171,12 +179,12 @@ function transfer_color(source::Array{RGB{Normed{UInt8,8}},2}, target::Array{RGB
     A = covsqₛ * covsqₜ
     b = s̄ - A * t̄
     map(target) do x
-        r = clamp.(A * px(x) + b, 0f0, 1f0)
-        RGB(r...)
+        r = A * px(x) + b
+        RGB(map(clamp01nan, r)...)
     end
 end
 
-function get_images(style::Symbol=:starry, transfer::Bool=true; content_url="", dsize=(226, 226))
+function get_images(style::Symbol=:starry, transfer::Bool=true; content_url=nothing, dsize=(226, 226))
     if content_url === nothing
         cim = Images.load("img.jpg")
     else
@@ -197,10 +205,44 @@ function get_images(style::Symbol=:starry, transfer::Bool=true; content_url="", 
     else
         colim = copy(cim)
     end
-    return preprocess_array.(img_to_array.((cim, colim, sim)), (dsize,))
+    return preprocess_array.(map(img_to_array, (cim, colim, sim)), (dsize,))
 end
 
-function train(sty::Symbol=:starry, n::Int=50;plt::Bool=false,α=1e-3, β=1, γ=1, init::Symbol=:content,lr::Float32=0.02f0,transfer::Bool=true,content_url=nothing,dsize=(226, 226),save_every=nothing)
+function save_image(fn::String, image)
+    im = arr_to_img(deprocess_array(image))
+    Images.save(fn, im)
+    return nothing
+end
+
+function make_composition(o, s, t)::Array{Float32,3}
+    i1, i2, i3 = map(deprocess_array, (o, s, t))
+    hcat(i1, i2, i3)
+end
+
+function save_composition(fn::String, original, style, final)
+    narr = make_composition(copy.((original, style, final))...)
+    if !isdir("outputs")
+        mkdir("outputs")
+    end
+
+    save_image("outputs/" * fn, narr)
+    return nothing
+end
+
+function save_run_and_clean()
+    if !isdir("runs")
+        mkdir("runs")
+    end
+    files = map(x -> parse(Int, split(split(x, "_")[end], ".")[begin]), readdir("runs"))
+    last = length(files) > 0 ? maximum(files) + 1 : 1
+    
+    Tar.create("outputs", "runs/run_$last.tar")
+    rm("outputs", recursive=true)
+return nothing
+end
+
+function train(sty::Symbol=:starry, n::Int=50;plt::Bool=false,α=1e-2, β=10, γ=1e-1, init::Symbol=:content,lr::Float32=0.02f0,transfer::Bool=true,content_url=nothing,dsize=(226, 226),save_every=nothing)
+    rm("outputs", force=true, recursive=true)
     GC.gc()
     CUDA.reclaim()
     @info "Loading model"
@@ -220,11 +262,11 @@ function train(sty::Symbol=:starry, n::Int=50;plt::Bool=false,α=1e-3, β=1, γ=
     elseif init == :sum 
         target_image = (content_image + style_image) ./ 2
     end
-    ipa = Flux.params(target_image)
     opt = ADAM(lr, (0.9, 0.999))
 
     stylef = style(vgg, style_image)
     contentf = content(vgg, content_image)
+    ipa = Flux.params(target_image)
 
     losses = Array{Float32,1}()
     c_loss = Array{Float32,1}()
@@ -232,18 +274,13 @@ function train(sty::Symbol=:starry, n::Int=50;plt::Bool=false,α=1e-3, β=1, γ=
     t_loss = Array{Float32,1}()
 
     loss(x1; kwargs...) = total_loss(vgg, x1, contentf, stylef; α=α, β=β, γ=γ, kwargs...)
-
-    function save_image(i::Integer, content_image::Array{Float32,3}, style_image::Array{Float32,3}, target_image::Array{Float32,3})
-        image = hcat(deprocess_array.((content_image, style_image, clamp.(target_image, -1f0, 1f0)))...)
-        image = clamp.(image, 0.0f0, 1.0f0)
-        Images.save("output_$i.jpg", arr_to_img(image))
-    end
+    last_iteration = 0
+    save_composition("output_0.jpg", ocontent_image, style_image, target_image)
     for i = 1:n
         @info "Iteration $i"
         gs = gradient(ipa) do
             loss(target_image)
         end
-
         Flux.update!(opt, ipa, gs)
         ls, cl, sl, tl = loss(target_image, splat=true)
         push!(losses, ls)
@@ -251,29 +288,37 @@ function train(sty::Symbol=:starry, n::Int=50;plt::Bool=false,α=1e-3, β=1, γ=
         push!(s_loss, sl)
         push!(t_loss, tl)
         if plt
-            IJulia.clear_output(true)
-            display(arr_to_img(hcat(deprocess_array.((ocontent_image, style_image, clamp.(target_image, -1f0, 1f0)))...)))
+            try
+                IJulia.clear_output(true)
+            catch e
+            end
+            Plots.display(arr_to_img(make_composition(ocontent_image, style_image, target_image)))
         end
-        save_every !== nothing && i % save_every == 0 && save_image(i, ocontent_image, style_image, target_image)
-        
+        if save_every !== nothing
+            if i % save_every == 0
+                save_composition("output_$i.jpg", ocontent_image, style_image, target_image)
+            end
+        end
+        last_iteration = i
     end
-    cimage = hcat(deprocess_array.((ocontent_image, style_image, target_image))...)
-    bimage = hcat(deprocess_array.((ocontent_image, style_image, clamp.(target_image, -1f0, 1f0)))...)
-    cimage = clamp.(cimage, 0.0f0, 1.0f0)
-    bimage = clamp.(bimage, 0.0f0, 1.0f0)
-    Images.save("output.jpg", arr_to_img(cimage))
-    Images.save("output2.jpg", arr_to_img(bimage))
+    save_composition("output_$last_iteration.jpg", ocontent_image, style_image, target_image)
     @info "Finished"
-    if plt
-        plot(losses, title="Losses", label="Total loss")
+        if plt
+        plot(losses, title="Losses", label="Total loss", )
         plot!(c_loss, label="Content loss")
         plot!(s_loss, label="Style loss")
-        plot!(t_loss, label="Total variation loss", yaxis=:log) |> display
+        f1 = plot!(t_loss, label="Total variation loss", yaxis=(:log, (1, Inf)))
+        png(f1, "outputs/losses_plot.png")
+        Plots.display(f1)
 
         h, w, c, n = size(content_image)
         histogram(reshape(deprocess_array(ocontent_image), h * w, c), α=0.3, layout=3, label="content")
         histogram!(reshape(clamp.(deprocess_array(target_image), 0f0, 1f0), h * w, c), α=0.3, layout=3, label="target")
-        display(histogram!(reshape(deprocess_array(style_image), h * w, c), α=0.3, layout=3, label="style"))
+        h1 = histogram!(reshape(deprocess_array(style_image), h * w, c), α=0.3, layout=3, label="style")
+        png(h1, "outputs/histograms.png")
+        Plots.display(h1)
     end
+    @save "outputs/losses.bson" losses c_loss s_loss t_loss α β γ
+    save_run_and_clean()
     return target_image
 end
